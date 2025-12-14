@@ -14,7 +14,7 @@ HEADERS = {"User-Agent": "Mozilla/5.0"}
 DATA_FILE = "sent_deals.json"
 HISTORY_FILE = "price_history.json"
 
-TEST_MODE = True  # set True to force a test alert
+TEST_MODE = False  # set True to force a test alert
 
 STORE_NAME = "🟩 Micro Center (Tustin, CA)"
 
