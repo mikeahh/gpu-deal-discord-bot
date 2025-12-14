@@ -101,3 +101,5 @@ if __name__ == "__main__":
     check_newegg(sent)
     check_bestbuy(sent)
     save_sent(sent)
+
+send_discord("TEST GPU 4090", 999, "Test Store", "https://example.com")
