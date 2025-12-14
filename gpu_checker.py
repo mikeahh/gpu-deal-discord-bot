@@ -11,7 +11,7 @@ from datetime import datetime
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-TEST_MODE = True  # ← SET TO True TO SEND TEST ALERTS
+TEST_MODE = False  # ← SET TO True TO SEND TEST ALERTS
 
 SENT_FILE = "sent_deals.json"
 
