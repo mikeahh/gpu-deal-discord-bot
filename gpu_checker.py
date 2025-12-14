@@ -2,34 +2,30 @@ import requests
 import os
 import json
 from bs4 import BeautifulSoup
+from datetime import datetime
 
 # ======================
-# SETTINGS
+# CONFIG
 # ======================
 
 WEBHOOK = os.getenv("DISCORD_WEBHOOK")
-
-ROLE_PING = ""  # Example: "<@&123456789012345678>" or leave blank
-TEST_MODE = False  # 🔴 SET TRUE TO FORCE A TEST ALERT
-
 HEADERS = {"User-Agent": "Mozilla/5.0"}
+
 DATA_FILE = "sent_deals.json"
+HISTORY_FILE = "price_history.json"
 
-# ======================
-# STORES (Name + Emoji)
-# ======================
+TEST_MODE = False  # set True to force a test alert
 
-STORES = {
-    "Amazon": "🟧 Amazon",
-    "Newegg": "🟥 Newegg",
-    "Best Buy": "🟦 Best Buy",
-    "Micro Center": "🟩 Micro Center"
-}
+STORE_NAME = "🟩 Micro Center (Tustin, CA)"
 
-# ======================
-# NVIDIA MSRP (USD)
-# ======================
+# Micro Center Tustin store ID
+# This URL is specific to Tustin pricing
+MICROCENTER_URL = (
+    "https://www.microcenter.com/search/search_results.aspx"
+    "?Ntt=rtx+gpu&storeid=101"
+)
 
+# NVIDIA MSRP
 MSRP = {
     "RTX 4070": 599,
     "RTX 4070 SUPER": 599,
@@ -44,52 +40,66 @@ MSRP = {
     "RTX 5090": 1599
 }
 
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
+
 # ======================
-# STATE TRACKING
+# STATE
 # ======================
 
-def load_sent():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
+def load_json(file):
+    if os.path.exists(file):
+        with open(file, "r") as f:
             return json.load(f)
     return []
 
-def save_sent(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f)
+def save_json(file, data):
+    with open(file, "w") as f:
+        json.dump(data, f, indent=2)
 
-SENT = load_sent()
+SENT = load_json(DATA_FILE)
 
-def already_sent(store, model):
-    key = f"{store}-{model}"
-    if key in SENT:
+def already_sent(model):
+    if model in SENT:
         return True
-    SENT.append(key)
-    save_sent(SENT)
+    SENT.append(model)
+    save_json(DATA_FILE, SENT)
     return False
+
+# ======================
+# PRICE HISTORY
+# ======================
+
+def record_price(model, price, link):
+    history = load_json(HISTORY_FILE)
+    history.setdefault(model, []).append({
+        "price": price,
+        "link": link,
+        "timestamp": datetime.utcnow().isoformat()
+    })
+    save_json(HISTORY_FILE, history)
 
 # ======================
 # DISCORD
 # ======================
 
-def send_discord(model, price, store, link):
+def send_discord(model, price, link):
     msrp = MSRP[model]
     delta = price - msrp
     sign = "+" if delta > 0 else ""
 
     message = {
         "content": (
-            f"{ROLE_PING}\n"
             "🔥 **GPU DEAL FOUND** 🔥\n\n"
             f"🎮 **{model}**\n"
-            f"🏪 {STORES[store]}\n"
+            f"🏪 {STORE_NAME}\n"
             f"💵 **Price:** ${price}\n"
             f"💰 **MSRP:** ${msrp} ({sign}{delta}$)\n"
             f"🔗 {link}"
         )
     }
 
-    requests.post(WEBHOOK, json=message)
+    SESSION.post(WEBHOOK, json=message)
 
 # ======================
 # FILTERING
@@ -98,9 +108,9 @@ def send_discord(model, price, store, link):
 def valid_gpu(title):
     t = title.upper()
     return (
-        "RTX" in t
-        and ("RTX 40" in t or "RTX 50" in t)
-        and "60" not in t
+        "RTX" in t and
+        ("RTX 40" in t or "RTX 50" in t) and
+        "60" not in t
     )
 
 def get_model(title):
@@ -110,102 +120,19 @@ def get_model(title):
     return None
 
 # ======================
-# HTTP SESSION (OPTIMIZATION)
+# SCRAPER (TUSTIN ONLY)
 # ======================
 
-SESSION = requests.Session()
-SESSION.headers.update(HEADERS)
-
-# ======================
-# STORES
-# ======================
-
-def check_newegg():
+def check_microcenter_tustin():
     soup = BeautifulSoup(
-        SESSION.get("https://www.newegg.com/p/pl?d=rtx+gpu", timeout=10).text,
-        "html.parser"
-    )
-
-    for item in soup.select(".item-cell"):
-        title = item.select_one(".item-title")
-        price = item.select_one(".price-current strong")
-        if not title or not price:
-            continue
-
-        name = title.text.strip()
-        if not valid_gpu(name):
-            continue
-
-        model = get_model(name)
-        if not model:
-            continue
-
-        price = int(price.text.replace(",", ""))
-        if price <= MSRP[model] and not already_sent("Newegg", model):
-            send_discord(model, price, "Newegg", title["href"])
-
-def check_bestbuy():
-    soup = BeautifulSoup(
-        SESSION.get("https://www.bestbuy.com/site/searchpage.jsp?st=rtx+gpu", timeout=10).text,
-        "html.parser"
-    )
-
-    for item in soup.select(".sku-item"):
-        title = item.select_one(".sku-title a")
-        price = item.select_one(".priceView-customer-price span")
-        if not title or not price:
-            continue
-
-        name = title.text.strip()
-        if not valid_gpu(name):
-            continue
-
-        model = get_model(name)
-        if not model:
-            continue
-
-        price = int(price.text.replace("$", "").replace(",", ""))
-        link = "https://www.bestbuy.com" + title["href"]
-
-        if price <= MSRP[model] and not already_sent("Best Buy", model):
-            send_discord(model, price, "Best Buy", link)
-
-def check_amazon():
-    soup = BeautifulSoup(
-        SESSION.get("https://www.amazon.com/s?k=rtx+gpu", timeout=10).text,
-        "html.parser"
-    )
-
-    for item in soup.select(".s-result-item"):
-        title = item.select_one("h2 span")
-        price = item.select_one(".a-price-whole")
-        link = item.select_one("h2 a")
-        if not title or not price or not link:
-            continue
-
-        name = title.text.strip()
-        if not valid_gpu(name):
-            continue
-
-        model = get_model(name)
-        if not model:
-            continue
-
-        price = int(price.text.replace(",", ""))
-        link = "https://www.amazon.com" + link["href"]
-
-        if price <= MSRP[model] and not already_sent("Amazon", model):
-            send_discord(model, price, "Amazon", link)
-
-def check_microcenter():
-    soup = BeautifulSoup(
-        SESSION.get("https://www.microcenter.com/search/search_results.aspx?Ntt=rtx+gpu", timeout=10).text,
+        SESSION.get(MICROCENTER_URL, timeout=10).text,
         "html.parser"
     )
 
     for item in soup.select(".product_wrapper"):
         title = item.select_one(".h2")
         price = item.select_one(".price")
+
         if not title or not price:
             continue
 
@@ -217,11 +144,17 @@ def check_microcenter():
         if not model:
             continue
 
-        price = int(price.text.replace("$", "").replace(",", ""))
+        try:
+            price_val = int(price.text.replace("$", "").replace(",", ""))
+        except:
+            continue
+
         link = "https://www.microcenter.com" + title.find("a")["href"]
 
-        if price <= MSRP[model] and not already_sent("Micro Center", model):
-            send_discord(model, price, "Micro Center", link)
+        record_price(model, price_val, link)
+
+        if price_val <= MSRP[model] and not already_sent(model):
+            send_discord(model, price_val, link)
 
 # ======================
 # TEST MODE
@@ -231,8 +164,7 @@ def run_test():
     send_discord(
         "RTX 4090",
         1399,
-        "Amazon",
-        "https://example.com"
+        "https://www.microcenter.com"
     )
 
 # ======================
@@ -243,7 +175,4 @@ if __name__ == "__main__":
     if TEST_MODE:
         run_test()
     else:
-        check_newegg()
-        check_bestbuy()
-        check_amazon()
-        check_microcenter()
+        check_microcenter_tustin()
