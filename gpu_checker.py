@@ -1,5 +1,34 @@
-import requests, os, json, re
+import requests
+import os
+import json
 from bs4 import BeautifulSoup
+
+# ======================
+# SETTINGS
+# ======================
+
+WEBHOOK = os.getenv("DISCORD_WEBHOOK")
+
+ROLE_PING = ""  # Example: "<@&123456789012345678>" or leave blank
+TEST_MODE = False  # 🔴 SET TRUE TO FORCE A TEST ALERT
+
+HEADERS = {"User-Agent": "Mozilla/5.0"}
+DATA_FILE = "sent_deals.json"
+
+# ======================
+# STORES (Name + Emoji)
+# ======================
+
+STORES = {
+    "Amazon": "🟧 Amazon",
+    "Newegg": "🟥 Newegg",
+    "Best Buy": "🟦 Best Buy",
+    "Micro Center": "🟩 Micro Center"
+}
+
+# ======================
+# NVIDIA MSRP (USD)
+# ======================
 
 MSRP = {
     "RTX 4070": 599,
@@ -15,146 +44,206 @@ MSRP = {
     "RTX 5090": 1599
 }
 
-WEBHOOK = os.getenv("DISCORD_WEBHOOK")
-HEADERS = {"User-Agent": "Mozilla/5.0"}
-
-DATA_FILE = "sent_deals.json"
-
-VALID_GPUS = {
-    "RTX 4070": 700,
-    "RTX 4070 SUPER": 750,
-    "RTX 4080": 1100,
-    "RTX 4080 SUPER": 1150,
-    "RTX 4090": 1600,
-    "RTX 5070": 9999,
-    "RTX 5080": 9999,
-    "RTX 5090": 9999
-}
-
-EXCLUDED = ["4060", "4060 TI"]
+# ======================
+# STATE TRACKING
+# ======================
 
 def load_sent():
-    if not os.path.exists(DATA_FILE):
-        return set()
-    with open(DATA_FILE) as f:
-        return set(json.load(f))
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r") as f:
+            return json.load(f)
+    return []
 
-def save_sent(sent):
+def save_sent(data):
     with open(DATA_FILE, "w") as f:
-        json.dump(list(sent), f)
+        json.dump(data, f)
 
-def parse_price(text):
-    nums = re.findall(r"\d+", text.replace(",", ""))
-    return int(nums[0]) if nums else None
+SENT = load_sent()
 
-def send_discord(name, price, store, link):
-    msrp = MSRP.get(name, "Unknown")
-    diff = ""
-    if isinstance(msrp, int):
-        diff = f"\n💰 **MSRP:** ${msrp} ({price - msrp:+}$)"
+def already_sent(store, model):
+    key = f"{store}-{model}"
+    if key in SENT:
+        return True
+    SENT.append(key)
+    save_sent(SENT)
+    return False
+
+# ======================
+# DISCORD
+# ======================
+
+def send_discord(model, price, store, link):
+    msrp = MSRP[model]
+    delta = price - msrp
+    sign = "+" if delta > 0 else ""
 
     message = {
         "content": (
-            f"🔥 **GPU DEAL FOUND** 🔥\n"
-            f"**{name}**\n"
-            f"🏪 {store}\n"
-            f"💵 **Price:** ${price}{diff}\n"
+            f"{ROLE_PING}\n"
+            "🔥 **GPU DEAL FOUND** 🔥\n\n"
+            f"🎮 **{model}**\n"
+            f"🏪 {STORES[store]}\n"
+            f"💵 **Price:** ${price}\n"
+            f"💰 **MSRP:** ${msrp} ({sign}{delta}$)\n"
             f"🔗 {link}"
         )
     }
 
     requests.post(WEBHOOK, json=message)
 
-def check_newegg(sent):
-    url = "https://www.newegg.com/p/pl?d=rtx+graphics+card"
-    soup = BeautifulSoup(requests.get(url, headers=HEADERS).text, "html.parser")
+# ======================
+# FILTERING
+# ======================
+
+def valid_gpu(title):
+    t = title.upper()
+    return (
+        "RTX" in t
+        and ("RTX 40" in t or "RTX 50" in t)
+        and "60" not in t
+    )
+
+def get_model(title):
+    for model in MSRP:
+        if model in title:
+            return model
+    return None
+
+# ======================
+# HTTP SESSION (OPTIMIZATION)
+# ======================
+
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
+
+# ======================
+# STORES
+# ======================
+
+def check_newegg():
+    soup = BeautifulSoup(
+        SESSION.get("https://www.newegg.com/p/pl?d=rtx+gpu", timeout=10).text,
+        "html.parser"
+    )
 
     for item in soup.select(".item-cell"):
         title = item.select_one(".item-title")
-        price = item.select_one(".price-current")
-
+        price = item.select_one(".price-current strong")
         if not title or not price:
             continue
 
-        name = title.text.upper()
-        link = title["href"]
-
-        if link in sent or any(x in name for x in EXCLUDED):
+        name = title.text.strip()
+        if not valid_gpu(name):
             continue
 
-        for gpu, limit in VALID_GPUS.items():
-            if gpu in name:
-                p = parse_price(price.text)
-                if p and p <= limit:
-                    send_discord(name, p, "Newegg", link)
-                    sent.add(link)
+        model = get_model(name)
+        if not model:
+            continue
 
-def check_bestbuy(sent):
-    url = "https://www.bestbuy.com/site/searchpage.jsp?st=rtx+graphics+card"
-    soup = BeautifulSoup(requests.get(url, headers=HEADERS).text, "html.parser")
+        price = int(price.text.replace(",", ""))
+        if price <= MSRP[model] and not already_sent("Newegg", model):
+            send_discord(model, price, "Newegg", title["href"])
+
+def check_bestbuy():
+    soup = BeautifulSoup(
+        SESSION.get("https://www.bestbuy.com/site/searchpage.jsp?st=rtx+gpu", timeout=10).text,
+        "html.parser"
+    )
 
     for item in soup.select(".sku-item"):
         title = item.select_one(".sku-title a")
         price = item.select_one(".priceView-customer-price span")
-
         if not title or not price:
             continue
 
-        name = title.text.upper()
-        link = "https://www.bestbuy.com" + title["href"]
-
-        if link in sent or any(x in name for x in EXCLUDED):
+        name = title.text.strip()
+        if not valid_gpu(name):
             continue
 
-        for gpu, limit in VALID_GPUS.items():
-            if gpu in name:
-                p = parse_price(price.text)
-                if p and p <= limit:
-                    send_discord(name, p, "Best Buy", link)
-                    sent.add(link)
+        model = get_model(name)
+        if not model:
+            continue
+
+        price = int(price.text.replace("$", "").replace(",", ""))
+        link = "https://www.bestbuy.com" + title["href"]
+
+        if price <= MSRP[model] and not already_sent("Best Buy", model):
+            send_discord(model, price, "Best Buy", link)
 
 def check_amazon():
-    url = "https://www.amazon.com/s?k=rtx+gpu"
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
-
-    r = requests.get(url, headers=headers, timeout=10)
-    soup = BeautifulSoup(r.text, "html.parser")
+    soup = BeautifulSoup(
+        SESSION.get("https://www.amazon.com/s?k=rtx+gpu", timeout=10).text,
+        "html.parser"
+    )
 
     for item in soup.select(".s-result-item"):
         title = item.select_one("h2 span")
-        price_whole = item.select_one(".a-price-whole")
-        price_frac = item.select_one(".a-price-fraction")
+        price = item.select_one(".a-price-whole")
         link = item.select_one("h2 a")
-
-        if not title or not price_whole or not link:
+        if not title or not price or not link:
             continue
 
         name = title.text.strip()
-
-        # Filter NVIDIA 40/50 series but exclude 60/60 Ti
-        if not any(x in name for x in ["RTX 40", "RTX 50"]):
-            continue
-        if "60" in name:
+        if not valid_gpu(name):
             continue
 
-        try:
-            price = int(price_whole.text.replace(",", ""))
-        except:
+        model = get_model(name)
+        if not model:
             continue
 
-        full_link = "https://www.amazon.com" + link["href"]
+        price = int(price.text.replace(",", ""))
+        link = "https://www.amazon.com" + link["href"]
 
-        for model in MSRP:
-            if model in name and price <= MSRP[model]:
-                send_discord(model, price, "Amazon", full_link)
+        if price <= MSRP[model] and not already_sent("Amazon", model):
+            send_discord(model, price, "Amazon", link)
+
+def check_microcenter():
+    soup = BeautifulSoup(
+        SESSION.get("https://www.microcenter.com/search/search_results.aspx?Ntt=rtx+gpu", timeout=10).text,
+        "html.parser"
+    )
+
+    for item in soup.select(".product_wrapper"):
+        title = item.select_one(".h2")
+        price = item.select_one(".price")
+        if not title or not price:
+            continue
+
+        name = title.text.strip()
+        if not valid_gpu(name):
+            continue
+
+        model = get_model(name)
+        if not model:
+            continue
+
+        price = int(price.text.replace("$", "").replace(",", ""))
+        link = "https://www.microcenter.com" + title.find("a")["href"]
+
+        if price <= MSRP[model] and not already_sent("Micro Center", model):
+            send_discord(model, price, "Micro Center", link)
+
+# ======================
+# TEST MODE
+# ======================
+
+def run_test():
+    send_discord(
+        "RTX 4090",
+        1399,
+        "Amazon",
+        "https://example.com"
+    )
+
+# ======================
+# RUN
+# ======================
 
 if __name__ == "__main__":
-    sent = load_sent()
-    check_newegg(sent)
-    check_bestbuy(sent)
-    check_amazon(sent)
-    save_sent(sent)
-
-send_discord("TEST GPU 4090", 999, "Test Store", "https://example.com")
+    if TEST_MODE:
+        run_test()
+    else:
+        check_newegg()
+        check_bestbuy()
+        check_amazon()
+        check_microcenter()
