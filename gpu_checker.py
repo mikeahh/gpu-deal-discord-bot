@@ -1,127 +1,69 @@
 import requests
-import os
 import json
+import os
 from bs4 import BeautifulSoup
 from datetime import datetime
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
-# ======================
+# =========================
 # CONFIG
-# ======================
+# =========================
 
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-TEST_MODE = False
-SENT_FILE = "sent_deals.json"
+SEEN_FILE = "seen_gpus.json"
+TIMEOUT = 10
 
-# ======================
-# RETRY SESSION
-# ======================
-
-session = requests.Session()
-
-retries = Retry(
-    total=3,
-    backoff_factor=2,
-    status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["GET"],
-)
-
-adapter = HTTPAdapter(max_retries=retries)
-session.mount("https://", adapter)
-session.mount("http://", adapter)
-
-# ======================
-# MSRP
-# ======================
-
-MSRP = {
-    "RTX 4070": 599,
-    "RTX 4070 SUPER": 599,
-    "RTX 4070 Ti": 799,
-    "RTX 4070 Ti SUPER": 799,
-    "RTX 4080": 1199,
-    "RTX 4080 SUPER": 999,
-    "RTX 4090": 1599,
-    "RTX 5070": 549,
-    "RTX 5070 Ti": 749,
-    "RTX 5080": 999,
-    "RTX 5090": 1599,
+MSRP_LIMITS = {
+    "RTX 4070": 600,
+    "RTX 4070 SUPER": 600,
+    "RTX 4070 Ti": 800,
+    "RTX 4080": 1200,
+    "RTX 4080 SUPER": 1000,
 }
 
-# ======================
-# STATE
-# ======================
+# =========================
+# UTILITIES
+# =========================
 
-def load_sent():
-    if os.path.exists(SENT_FILE):
-        with open(SENT_FILE, "r") as f:
-            return json.load(f)
-    return []
+def load_seen():
+    if not os.path.exists(SEEN_FILE):
+        return {}
+    with open(SEEN_FILE, "r") as f:
+        return json.load(f)
 
-def save_sent(data):
-    with open(SENT_FILE, "w") as f:
-        json.dump(data, f)
+def save_seen(seen):
+    with open(SEEN_FILE, "w") as f:
+        json.dump(seen, f, indent=2)
 
-SENT = load_sent()
-
-# ======================
-# HELPERS
-# ======================
-
-def valid_gpu(title):
-    t = title.upper()
-    return "RTX" in t and ("40" in t or "50" in t) and "60" not in t
-
-def extract_model(title):
-    for model in MSRP:
-        if model in title:
-            return model
-    return None
-
-def send_discord(store, model, price, link, test=False):
-    delta = price - MSRP[model]
-    sign = "+" if delta > 0 else ""
-
-    header = "🧪 **TEST ALERT** 🧪\n\n" if test else "🔥 **GPU DEAL FOUND** 🔥\n\n"
-
+def send_discord(title, price, link, store):
     payload = {
-        "content": (
-            header
-            + f"🎮 **{model}**\n"
-            + f"🏪 {store}\n"
-            + f"💵 **Price:** ${price}\n"
-            + f"💰 **MSRP:** ${MSRP[model]} ({sign}{delta}$)\n"
-            + f"🔗 {link}"
-        )
+        "content": f"🚨 **GPU FOUND AT MSRP** 🚨\n"
+                   f"**Store:** {store}\n"
+                   f"**Product:** {title}\n"
+                   f"**Price:** ${price}\n"
+                   f"{link}"
     }
+    requests.post(DISCORD_WEBHOOK, json=payload, timeout=TIMEOUT)
 
-    try:
-        session.post(DISCORD_WEBHOOK, json=payload, timeout=10)
-    except Exception as e:
-        print(f"⚠️ Discord send failed: {e}")
+def is_msrp(title, price):
+    for model, limit in MSRP_LIMITS.items():
+        if model.lower() in title.lower() and price <= limit:
+            return True
+    return False
 
-# ======================
+# =========================
 # STORE CHECKERS
-# ======================
+# =========================
 
-def check_bestbuy(test=False):
+def check_bestbuy(session, seen):
     print("🟦 Checking Best Buy")
-    url = "https://www.bestbuy.com/site/searchpage.jsp?st=rtx+graphics+card"
-
-    try:
-        r = session.get(url, headers=HEADERS, timeout=20)
-        r.raise_for_status()
-    except Exception as e:
-        print(f"⚠️ Best Buy blocked or failed: {e}")
-        return
-
+    url = "https://www.bestbuy.com/site/searchpage.jsp?st=rtx+4070"
+    r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
     soup = BeautifulSoup(r.text, "html.parser")
 
     for item in soup.select(".sku-item"):
@@ -132,40 +74,24 @@ def check_bestbuy(test=False):
             continue
 
         title = title_el.text.strip()
-        if not valid_gpu(title):
+        price = int(price_el.text.replace("$", "").replace(",", ""))
+        link = "https://www.bestbuy.com" + title_el["href"]
+
+        key = f"bestbuy|{title}|{price}"
+        if key in seen:
             continue
 
-        model = extract_model(title)
-        if not model:
-            continue
+        if is_msrp(title, price):
+            send_discord(title, price, link, "Best Buy")
+            seen[key] = True
 
-        try:
-            price = int(price_el.text.replace("$", "").replace(",", ""))
-        except:
-            continue
-
-        link = "https://www.bestbuy.com" + title_el.a["href"]
-        key = f"BestBuy|{model}"
-
-        if (price <= MSRP[model] or test) and key not in SENT:
-            send_discord("🟦 Best Buy", model, price, link, test)
-            SENT.append(key)
-            save_sent(SENT)
-
-def check_amazon(test=False):
+def check_amazon(session, seen):
     print("🟧 Checking Amazon")
-    url = "https://www.amazon.com/s?k=rtx+graphics+card"
-
-    try:
-        r = session.get(url, headers=HEADERS, timeout=20)
-        r.raise_for_status()
-    except Exception as e:
-        print(f"⚠️ Amazon blocked or failed: {e}")
-        return
-
+    url = "https://www.amazon.com/s?k=rtx+4070"
+    r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
     soup = BeautifulSoup(r.text, "html.parser")
 
-    for item in soup.select("div[data-component-type='s-search-result']"):
+    for item in soup.select(".s-result-item"):
         title_el = item.select_one("h2 span")
         price_whole = item.select_one(".a-price-whole")
 
@@ -173,37 +99,26 @@ def check_amazon(test=False):
             continue
 
         title = title_el.text.strip()
-        if not valid_gpu(title):
-            continue
-
-        model = extract_model(title)
-        if not model:
-            continue
-
         try:
-            price = int(price_whole.text.replace(",", "").replace(".", ""))
+            price = int(price_whole.text.replace(",", ""))
         except:
             continue
 
-        link = "https://www.amazon.com" + item.select_one("h2 a")["href"]
-        key = f"Amazon|{model}"
+        link_el = item.select_one("h2 a")
+        link = "https://www.amazon.com" + link_el["href"]
 
-        if (price <= MSRP[model] or test) and key not in SENT:
-            send_discord("🟧 Amazon", model, price, link, test)
-            SENT.append(key)
-            save_sent(SENT)
+        key = f"amazon|{title}|{price}"
+        if key in seen:
+            continue
 
-def check_newegg(test=False):
+        if is_msrp(title, price):
+            send_discord(title, price, link, "Amazon")
+            seen[key] = True
+
+def check_newegg(session, seen):
     print("🟥 Checking Newegg")
-    url = "https://www.newegg.com/p/pl?d=rtx+graphics+card"
-
-    try:
-        r = session.get(url, headers=HEADERS, timeout=20)
-        r.raise_for_status()
-    except Exception as e:
-        print(f"⚠️ Newegg failed: {e}")
-        return
-
+    url = "https://www.newegg.com/p/pl?d=rtx+4070"
+    r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
     soup = BeautifulSoup(r.text, "html.parser")
 
     for item in soup.select(".item-cell"):
@@ -214,37 +129,25 @@ def check_newegg(test=False):
             continue
 
         title = title_el.text.strip()
-        if not valid_gpu(title):
-            continue
-
-        model = extract_model(title)
-        if not model:
-            continue
-
         try:
             price = int(price_el.text.replace(",", ""))
         except:
             continue
 
         link = title_el["href"]
-        key = f"Newegg|{model}"
 
-        if (price <= MSRP[model] or test) and key not in SENT:
-            send_discord("🟥 Newegg", model, price, link, test)
-            SENT.append(key)
-            save_sent(SENT)
+        key = f"newegg|{title}|{price}"
+        if key in seen:
+            continue
 
-def check_microcenter_tustin(test=False):
+        if is_msrp(title, price):
+            send_discord(title, price, link, "Newegg")
+            seen[key] = True
+
+def check_microcenter(session, seen):
     print("🟩 Checking Micro Center (Tustin)")
-    url = "https://www.microcenter.com/search/search_results.aspx?Ntt=rtx+gpu&storeid=101"
-
-    try:
-        r = session.get(url, headers=HEADERS, timeout=20)
-        r.raise_for_status()
-    except Exception as e:
-        print(f"⚠️ Micro Center failed: {e}")
-        return
-
+    url = "https://www.microcenter.com/search/search_results.aspx?N=&cat=&Ntt=rtx+4070"
+    r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
     soup = BeautifulSoup(r.text, "html.parser")
 
     for item in soup.select(".product_wrapper"):
@@ -255,40 +158,38 @@ def check_microcenter_tustin(test=False):
             continue
 
         title = title_el.text.strip()
-        if not valid_gpu(title):
-            continue
-
-        model = extract_model(title)
-        if not model:
-            continue
-
         try:
             price = int(price_el.text.replace("$", "").replace(",", ""))
         except:
             continue
 
-        link = "https://www.microcenter.com" + title_el.a["href"]
-        key = f"MicroCenter|{model}"
+        link = "https://www.microcenter.com" + title_el["href"]
 
-        if (price <= MSRP[model] or test) and key not in SENT:
-            send_discord("🟩 Micro Center (Tustin, CA)", model, price, link, test)
-            SENT.append(key)
-            save_sent(SENT)
+        key = f"microcenter|{title}|{price}"
+        if key in seen:
+            continue
 
-# ======================
-# RUN
-# ======================
+        if is_msrp(title, price):
+            send_discord(title, price, link, "Micro Center (Tustin)")
+            seen[key] = True
+
+# =========================
+# MAIN
+# =========================
 
 if __name__ == "__main__":
-    print(f"⏰ Run started at {datetime.utcnow()} UTC")
+    start = datetime.utcnow()
+    print(f"⏰ Run started at {start} UTC")
 
-    if TEST_MODE:
-        check_bestbuy(test=True)
-        check_amazon(test=True)
-        check_newegg(test=True)
-        check_microcenter_tustin(test=True)
-    else:
-        check_bestbuy()
-        check_amazon()
-        check_newegg()
-        check_microcenter_tustin()
+    seen = load_seen()
+
+    with requests.Session() as session:
+        check_bestbuy(session, seen)
+        check_amazon(session, seen)
+        check_newegg(session, seen)
+        check_microcenter(session, seen)
+
+    save_seen(seen)
+
+    end = datetime.utcnow()
+    print(f"✅ Run finished in {(end - start).total_seconds()} seconds")
