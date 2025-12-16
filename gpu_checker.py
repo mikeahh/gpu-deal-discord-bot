@@ -3,6 +3,8 @@ import os
 import json
 from bs4 import BeautifulSoup
 from datetime import datetime
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ======================
 # CONFIG
@@ -11,14 +13,32 @@ from datetime import datetime
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
-TEST_MODE = False  # ← SET True TO FORCE TEST ALERTS
+TEST_MODE = False
 SENT_FILE = "sent_deals.json"
 
 # ======================
-# MSRP (USD)
+# RETRY SESSION
+# ======================
+
+session = requests.Session()
+
+retries = Retry(
+    total=3,
+    backoff_factor=2,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET"],
+)
+
+adapter = HTTPAdapter(max_retries=retries)
+session.mount("https://", adapter)
+session.mount("http://", adapter)
+
+# ======================
+# MSRP
 # ======================
 
 MSRP = {
@@ -32,7 +52,7 @@ MSRP = {
     "RTX 5070": 549,
     "RTX 5070 Ti": 749,
     "RTX 5080": 999,
-    "RTX 5090": 1599
+    "RTX 5090": 1599,
 }
 
 # ======================
@@ -57,11 +77,7 @@ SENT = load_sent()
 
 def valid_gpu(title):
     t = title.upper()
-    return (
-        "RTX" in t
-        and ("40" in t or "50" in t)
-        and "60" not in t
-    )
+    return "RTX" in t and ("40" in t or "50" in t) and "60" not in t
 
 def extract_model(title):
     for model in MSRP:
@@ -77,31 +93,19 @@ def send_discord(store, model, price, link, test=False):
 
     payload = {
         "content": (
-            header +
-            f"🎮 **{model}**\n"
-            f"🏪 {store}\n"
-            f"💵 **Price:** ${price}\n"
-            f"💰 **MSRP:** ${MSRP[model]} ({sign}{delta}$)\n"
-            f"🔗 {link}"
+            header
+            + f"🎮 **{model}**\n"
+            + f"🏪 {store}\n"
+            + f"💵 **Price:** ${price}\n"
+            + f"💰 **MSRP:** ${MSRP[model]} ({sign}{delta}$)\n"
+            + f"🔗 {link}"
         )
     }
 
-    requests.post(DISCORD_WEBHOOK, json=payload)
-
-# ======================
-# TEST MODE
-# ======================
-
-def run_test():
-    print("🧪 TEST MODE ENABLED")
-
-    for fn in [
-        check_bestbuy,
-        check_amazon,
-        check_newegg,
-        check_microcenter_tustin
-    ]:
-        fn(test=True)
+    try:
+        session.post(DISCORD_WEBHOOK, json=payload, timeout=10)
+    except Exception as e:
+        print(f"⚠️ Discord send failed: {e}")
 
 # ======================
 # STORE CHECKERS
@@ -110,7 +114,15 @@ def run_test():
 def check_bestbuy(test=False):
     print("🟦 Checking Best Buy")
     url = "https://www.bestbuy.com/site/searchpage.jsp?st=rtx+graphics+card"
-    soup = BeautifulSoup(requests.get(url, headers=HEADERS).text, "html.parser")
+
+    try:
+        r = session.get(url, headers=HEADERS, timeout=20)
+        r.raise_for_status()
+    except Exception as e:
+        print(f"⚠️ Best Buy blocked or failed: {e}")
+        return
+
+    soup = BeautifulSoup(r.text, "html.parser")
 
     for item in soup.select(".sku-item"):
         title_el = item.select_one(".sku-title")
@@ -127,7 +139,11 @@ def check_bestbuy(test=False):
         if not model:
             continue
 
-        price = int(price_el.text.replace("$", "").replace(",", ""))
+        try:
+            price = int(price_el.text.replace("$", "").replace(",", ""))
+        except:
+            continue
+
         link = "https://www.bestbuy.com" + title_el.a["href"]
         key = f"BestBuy|{model}"
 
@@ -139,7 +155,15 @@ def check_bestbuy(test=False):
 def check_amazon(test=False):
     print("🟧 Checking Amazon")
     url = "https://www.amazon.com/s?k=rtx+graphics+card"
-    soup = BeautifulSoup(requests.get(url, headers=HEADERS).text, "html.parser")
+
+    try:
+        r = session.get(url, headers=HEADERS, timeout=20)
+        r.raise_for_status()
+    except Exception as e:
+        print(f"⚠️ Amazon blocked or failed: {e}")
+        return
+
+    soup = BeautifulSoup(r.text, "html.parser")
 
     for item in soup.select("div[data-component-type='s-search-result']"):
         title_el = item.select_one("h2 span")
@@ -172,7 +196,15 @@ def check_amazon(test=False):
 def check_newegg(test=False):
     print("🟥 Checking Newegg")
     url = "https://www.newegg.com/p/pl?d=rtx+graphics+card"
-    soup = BeautifulSoup(requests.get(url, headers=HEADERS).text, "html.parser")
+
+    try:
+        r = session.get(url, headers=HEADERS, timeout=20)
+        r.raise_for_status()
+    except Exception as e:
+        print(f"⚠️ Newegg failed: {e}")
+        return
+
+    soup = BeautifulSoup(r.text, "html.parser")
 
     for item in soup.select(".item-cell"):
         title_el = item.select_one(".item-title")
@@ -189,7 +221,11 @@ def check_newegg(test=False):
         if not model:
             continue
 
-        price = int(price_el.text.replace(",", ""))
+        try:
+            price = int(price_el.text.replace(",", ""))
+        except:
+            continue
+
         link = title_el["href"]
         key = f"Newegg|{model}"
 
@@ -201,7 +237,15 @@ def check_newegg(test=False):
 def check_microcenter_tustin(test=False):
     print("🟩 Checking Micro Center (Tustin)")
     url = "https://www.microcenter.com/search/search_results.aspx?Ntt=rtx+gpu&storeid=101"
-    soup = BeautifulSoup(requests.get(url, headers=HEADERS).text, "html.parser")
+
+    try:
+        r = session.get(url, headers=HEADERS, timeout=20)
+        r.raise_for_status()
+    except Exception as e:
+        print(f"⚠️ Micro Center failed: {e}")
+        return
+
+    soup = BeautifulSoup(r.text, "html.parser")
 
     for item in soup.select(".product_wrapper"):
         title_el = item.select_one(".h2")
@@ -239,7 +283,10 @@ if __name__ == "__main__":
     print(f"⏰ Run started at {datetime.utcnow()} UTC")
 
     if TEST_MODE:
-        run_test()
+        check_bestbuy(test=True)
+        check_amazon(test=True)
+        check_newegg(test=True)
+        check_microcenter_tustin(test=True)
     else:
         check_bestbuy()
         check_amazon()
