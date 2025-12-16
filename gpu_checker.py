@@ -16,7 +16,7 @@ HEADERS = {
 }
 
 SEEN_FILE = "seen_gpus.json"
-TIMEOUT = 10
+TIMEOUT = 8  # lower timeout = faster failures
 
 MSRP_LIMITS = {
     "RTX 4070": 600,
@@ -42,11 +42,13 @@ def save_seen(seen):
 
 def send_discord(title, price, link, store):
     payload = {
-        "content": f"🚨 **GPU FOUND AT MSRP** 🚨\n"
-                   f"**Store:** {store}\n"
-                   f"**Product:** {title}\n"
-                   f"**Price:** ${price}\n"
-                   f"{link}"
+        "content": (
+            "🚨 **GPU FOUND AT MSRP** 🚨\n"
+            f"**Store:** {store}\n"
+            f"**Product:** {title}\n"
+            f"**Price:** ${price}\n"
+            f"{link}"
+        )
     }
     requests.post(DISCORD_WEBHOOK, json=payload, timeout=TIMEOUT)
 
@@ -57,121 +59,125 @@ def is_msrp(title, price):
     return False
 
 # =========================
-# STORE CHECKERS
+# STORE CHECKERS (SAFE)
 # =========================
 
 def check_bestbuy(session, seen):
     print("🟦 Checking Best Buy")
-    url = "https://www.bestbuy.com/site/searchpage.jsp?st=rtx+4070"
-    r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
-    soup = BeautifulSoup(r.text, "html.parser")
+    try:
+        url = "https://www.bestbuy.com/site/searchpage.jsp?st=rtx+4070"
+        r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
+        soup = BeautifulSoup(r.text, "html.parser")
 
-    for item in soup.select(".sku-item"):
-        title_el = item.select_one(".sku-title")
-        price_el = item.select_one(".priceView-customer-price span")
+        for item in soup.select(".sku-item"):
+            title_el = item.select_one(".sku-title")
+            price_el = item.select_one(".priceView-customer-price span")
 
-        if not title_el or not price_el:
-            continue
+            if not title_el or not price_el:
+                continue
 
-        title = title_el.text.strip()
-        price = int(price_el.text.replace("$", "").replace(",", ""))
-        link = "https://www.bestbuy.com" + title_el["href"]
+            title = title_el.text.strip()
+            price = int(price_el.text.replace("$", "").replace(",", ""))
+            link = "https://www.bestbuy.com" + title_el["href"]
 
-        key = f"bestbuy|{title}|{price}"
-        if key in seen:
-            continue
+            key = f"bestbuy|{title}|{price}"
+            if key in seen:
+                continue
 
-        if is_msrp(title, price):
-            send_discord(title, price, link, "Best Buy")
-            seen[key] = True
+            if is_msrp(title, price):
+                send_discord(title, price, link, "Best Buy")
+                seen[key] = True
+
+    except Exception as e:
+        print(f"⚠️ Best Buy skipped: {e}")
 
 def check_amazon(session, seen):
     print("🟧 Checking Amazon")
-    url = "https://www.amazon.com/s?k=rtx+4070"
-    r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
-    soup = BeautifulSoup(r.text, "html.parser")
+    try:
+        url = "https://www.amazon.com/s?k=rtx+4070"
+        r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
+        soup = BeautifulSoup(r.text, "html.parser")
 
-    for item in soup.select(".s-result-item"):
-        title_el = item.select_one("h2 span")
-        price_whole = item.select_one(".a-price-whole")
+        for item in soup.select(".s-result-item"):
+            title_el = item.select_one("h2 span")
+            price_whole = item.select_one(".a-price-whole")
 
-        if not title_el or not price_whole:
-            continue
+            if not title_el or not price_whole:
+                continue
 
-        title = title_el.text.strip()
-        try:
+            title = title_el.text.strip()
             price = int(price_whole.text.replace(",", ""))
-        except:
-            continue
+            link_el = item.select_one("h2 a")
+            link = "https://www.amazon.com" + link_el["href"]
 
-        link_el = item.select_one("h2 a")
-        link = "https://www.amazon.com" + link_el["href"]
+            key = f"amazon|{title}|{price}"
+            if key in seen:
+                continue
 
-        key = f"amazon|{title}|{price}"
-        if key in seen:
-            continue
+            if is_msrp(title, price):
+                send_discord(title, price, link, "Amazon")
+                seen[key] = True
 
-        if is_msrp(title, price):
-            send_discord(title, price, link, "Amazon")
-            seen[key] = True
+    except Exception as e:
+        print(f"⚠️ Amazon skipped: {e}")
 
 def check_newegg(session, seen):
     print("🟥 Checking Newegg")
-    url = "https://www.newegg.com/p/pl?d=rtx+4070"
-    r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
-    soup = BeautifulSoup(r.text, "html.parser")
+    try:
+        url = "https://www.newegg.com/p/pl?d=rtx+4070"
+        r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
+        soup = BeautifulSoup(r.text, "html.parser")
 
-    for item in soup.select(".item-cell"):
-        title_el = item.select_one(".item-title")
-        price_el = item.select_one(".price-current strong")
+        for item in soup.select(".item-cell"):
+            title_el = item.select_one(".item-title")
+            price_el = item.select_one(".price-current strong")
 
-        if not title_el or not price_el:
-            continue
+            if not title_el or not price_el:
+                continue
 
-        title = title_el.text.strip()
-        try:
+            title = title_el.text.strip()
             price = int(price_el.text.replace(",", ""))
-        except:
-            continue
+            link = title_el["href"]
 
-        link = title_el["href"]
+            key = f"newegg|{title}|{price}"
+            if key in seen:
+                continue
 
-        key = f"newegg|{title}|{price}"
-        if key in seen:
-            continue
+            if is_msrp(title, price):
+                send_discord(title, price, link, "Newegg")
+                seen[key] = True
 
-        if is_msrp(title, price):
-            send_discord(title, price, link, "Newegg")
-            seen[key] = True
+    except Exception as e:
+        print(f"⚠️ Newegg skipped: {e}")
 
 def check_microcenter(session, seen):
     print("🟩 Checking Micro Center (Tustin)")
-    url = "https://www.microcenter.com/search/search_results.aspx?N=&cat=&Ntt=rtx+4070"
-    r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
-    soup = BeautifulSoup(r.text, "html.parser")
+    try:
+        url = "https://www.microcenter.com/search/search_results.aspx?N=&Ntt=rtx+4070"
+        r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
+        soup = BeautifulSoup(r.text, "html.parser")
 
-    for item in soup.select(".product_wrapper"):
-        title_el = item.select_one(".h2")
-        price_el = item.select_one(".price")
+        for item in soup.select(".product_wrapper"):
+            title_el = item.select_one(".h2")
+            price_el = item.select_one(".price")
 
-        if not title_el or not price_el:
-            continue
+            if not title_el or not price_el:
+                continue
 
-        title = title_el.text.strip()
-        try:
+            title = title_el.text.strip()
             price = int(price_el.text.replace("$", "").replace(",", ""))
-        except:
-            continue
+            link = "https://www.microcenter.com" + title_el["href"]
 
-        link = "https://www.microcenter.com" + title_el["href"]
+            key = f"microcenter|{title}|{price}"
+            if key in seen:
+                continue
 
-        key = f"microcenter|{title}|{price}"
-        if key in seen:
-            continue
+            if is_msrp(title, price):
+                send_discord(title, price, link, "Micro Center (Tustin)")
+                seen[key] = True
 
-        if is_msrp(title, price):
-            send_discord(title, price, link, "Micro Center (Tustin)")
-            seen[key] = True
+    except Exception as e:
+        print(f"⚠️ Micro Center skipped: {e}")
 
 # =========================
 # MAIN
