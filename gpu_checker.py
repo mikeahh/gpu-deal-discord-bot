@@ -1,201 +1,224 @@
 import requests
-import json
 import os
+import json
 from bs4 import BeautifulSoup
 from datetime import datetime
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# =========================
+# ======================
 # CONFIG
-# =========================
+# ======================
 
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL")
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    "Accept-Language": "en-US,en;q=0.9",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 }
 
-SEEN_FILE = "seen_gpus.json"
-TIMEOUT = 8  # lower timeout = faster failures
+TIMEOUT = 8
+SENT_FILE = "sent_gpu_deals.json"
+TEST_MODE = False  # set True to test Discord
 
-MSRP_LIMITS = {
-    "RTX 4070": 600,
-    "RTX 4070 SUPER": 600,
-    "RTX 4070 Ti": 800,
-    "RTX 4080": 1200,
-    "RTX 4080 SUPER": 1000,
+# ======================
+# HTTP SESSION (FAST + SAFE)
+# ======================
+
+session = requests.Session()
+retries = Retry(
+    total=2,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET"]
+)
+adapter = HTTPAdapter(max_retries=retries)
+session.mount("https://", adapter)
+
+# ======================
+# STORES
+# ======================
+
+STORES = [
+    {
+        "name": "🟦 Best Buy",
+        "url": "https://www.bestbuy.com/site/searchpage.jsp?st=rtx+graphics+card"
+    },
+    {
+        "name": "🟧 Amazon",
+        "url": "https://www.amazon.com/s?k=rtx+graphics+card"
+    },
+    {
+        "name": "🟥 Newegg",
+        "url": "https://www.newegg.com/p/pl?d=rtx+graphics+card"
+    },
+    {
+        "name": "🟩 Micro Center (Tustin)",
+        "url": "https://www.microcenter.com/search/search_results.aspx?Ntt=rtx&storeid=101"
+    }
+]
+
+# ======================
+# NVIDIA MSRP
+# ======================
+
+MSRP = {
+    "RTX 4070": 599,
+    "RTX 4070 SUPER": 599,
+    "RTX 4070 TI": 799,
+    "RTX 4070 TI SUPER": 799,
+    "RTX 4080": 1199,
+    "RTX 4080 SUPER": 999,
+    "RTX 4090": 1599,
+    "RTX 5070": 549,
+    "RTX 5070 TI": 749,
+    "RTX 5080": 999,
+    "RTX 5090": 1599
 }
 
-# =========================
-# UTILITIES
-# =========================
+# ======================
+# STATE
+# ======================
 
-def load_seen():
-    if not os.path.exists(SEEN_FILE):
-        return {}
-    with open(SEEN_FILE, "r") as f:
-        return json.load(f)
+def load_sent():
+    if os.path.exists(SENT_FILE):
+        with open(SENT_FILE, "r") as f:
+            return set(json.load(f))
+    return set()
 
-def save_seen(seen):
-    with open(SEEN_FILE, "w") as f:
-        json.dump(seen, f, indent=2)
+def save_sent(data):
+    with open(SENT_FILE, "w") as f:
+        json.dump(list(data), f)
 
-def send_discord(title, price, link, store):
+SENT = load_sent()
+
+# ======================
+# HELPERS
+# ======================
+
+def valid_gpu(title):
+    t = title.upper()
+    return (
+        "RTX" in t
+        and ("RTX 40" in t or "RTX 50" in t)
+        and "60" not in t
+    )
+
+def extract_model(title):
+    t = title.upper()
+    for model in MSRP:
+        if model in t:
+            return model
+    return None
+
+def extract_price(text):
+    for word in text.split():
+        if word.startswith("$"):
+            try:
+                return int(word.replace("$", "").replace(",", ""))
+            except:
+                pass
+    return None
+
+def build_link(store_url, href):
+    if not href or not isinstance(href, str):
+        return None
+    if href.startswith("http"):
+        return href
+    base = store_url.split("/")[0] + "//" + store_url.split("/")[2]
+    return base + href
+
+# ======================
+# DISCORD
+# ======================
+
+def send_discord(store, model, price, link, test=False):
+    delta = price - MSRP[model]
+    sign = "+" if delta > 0 else ""
+
+    header = "🧪 **TEST ALERT** 🧪\n\n" if test else "🔥 **GPU DEAL FOUND** 🔥\n\n"
+
     payload = {
         "content": (
-            "🚨 **GPU FOUND AT MSRP** 🚨\n"
-            f"**Store:** {store}\n"
-            f"**Product:** {title}\n"
-            f"**Price:** ${price}\n"
-            f"{link}"
+            header +
+            f"🎮 **{model}**\n"
+            f"🏪 {store}\n"
+            f"💵 **Price:** ${price}\n"
+            f"💰 **MSRP:** ${MSRP[model]} ({sign}{delta}$)\n"
+            f"🔗 {link}"
         )
     }
-    requests.post(DISCORD_WEBHOOK, json=payload, timeout=TIMEOUT)
 
-def is_msrp(title, price):
-    for model, limit in MSRP_LIMITS.items():
-        if model.lower() in title.lower() and price <= limit:
-            return True
-    return False
+    session.post(DISCORD_WEBHOOK, json=payload, timeout=5)
 
-# =========================
-# STORE CHECKERS (SAFE)
-# =========================
+# ======================
+# STORE CHECK
+# ======================
 
-def check_bestbuy(session, seen):
-    print("🟦 Checking Best Buy")
+def check_store(store):
+    print(f"{store['name']} Checking")
+
     try:
-        url = "https://www.bestbuy.com/site/searchpage.jsp?st=rtx+4070"
-        r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        for item in soup.select(".sku-item"):
-            title_el = item.select_one(".sku-title")
-            price_el = item.select_one(".priceView-customer-price span")
-
-            if not title_el or not price_el:
-                continue
-
-            title = title_el.text.strip()
-            price = int(price_el.text.replace("$", "").replace(",", ""))
-            link = "https://www.bestbuy.com" + title_el["href"]
-
-            key = f"bestbuy|{title}|{price}"
-            if key in seen:
-                continue
-
-            if is_msrp(title, price):
-                send_discord(title, price, link, "Best Buy")
-                seen[key] = True
-
+        r = session.get(store["url"], headers=HEADERS, timeout=TIMEOUT)
     except Exception as e:
-        print(f"⚠️ Best Buy skipped: {e}")
+        print(f"⚠️ {store['name']} skipped: {e}")
+        return
 
-def check_amazon(session, seen):
-    print("🟧 Checking Amazon")
-    try:
-        url = "https://www.amazon.com/s?k=rtx+4070"
-        r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
-        soup = BeautifulSoup(r.text, "html.parser")
+    soup = BeautifulSoup(r.text, "html.parser")
 
-        for item in soup.select(".s-result-item"):
-            title_el = item.select_one("h2 span")
-            price_whole = item.select_one(".a-price-whole")
+    for a in soup.select("a"):
+        title = a.get_text(strip=True)
+        href = a.get("href")
 
-            if not title_el or not price_whole:
-                continue
+        if not title or not href:
+            continue
+        if not valid_gpu(title):
+            continue
 
-            title = title_el.text.strip()
-            price = int(price_whole.text.replace(",", ""))
-            link_el = item.select_one("h2 a")
-            link = "https://www.amazon.com" + link_el["href"]
+        model = extract_model(title)
+        if not model:
+            continue
 
-            key = f"amazon|{title}|{price}"
-            if key in seen:
-                continue
+        price = extract_price(a.parent.get_text(" ", strip=True))
+        if not price or price > MSRP[model]:
+            continue
 
-            if is_msrp(title, price):
-                send_discord(title, price, link, "Amazon")
-                seen[key] = True
+        link = build_link(store["url"], href)
+        if not link:
+            continue
 
-    except Exception as e:
-        print(f"⚠️ Amazon skipped: {e}")
+        key = f"{store['name']}|{model}"
+        if key in SENT:
+            continue
 
-def check_newegg(session, seen):
-    print("🟥 Checking Newegg")
-    try:
-        url = "https://www.newegg.com/p/pl?d=rtx+4070"
-        r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
-        soup = BeautifulSoup(r.text, "html.parser")
+        send_discord(store["name"], model, price, link)
+        SENT.add(key)
+        save_sent(SENT)
 
-        for item in soup.select(".item-cell"):
-            title_el = item.select_one(".item-title")
-            price_el = item.select_one(".price-current strong")
+        print(f"✅ SENT: {model} @ ${price}")
 
-            if not title_el or not price_el:
-                continue
+# ======================
+# TEST MODE
+# ======================
 
-            title = title_el.text.strip()
-            price = int(price_el.text.replace(",", ""))
-            link = title_el["href"]
+def run_test():
+    for store in STORES:
+        send_discord(
+            store=store["name"],
+            model="RTX 4080 SUPER",
+            price=999,
+            link=store["url"],
+            test=True
+        )
 
-            key = f"newegg|{title}|{price}"
-            if key in seen:
-                continue
-
-            if is_msrp(title, price):
-                send_discord(title, price, link, "Newegg")
-                seen[key] = True
-
-    except Exception as e:
-        print(f"⚠️ Newegg skipped: {e}")
-
-def check_microcenter(session, seen):
-    print("🟩 Checking Micro Center (Tustin)")
-    try:
-        url = "https://www.microcenter.com/search/search_results.aspx?N=&Ntt=rtx+4070"
-        r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        for item in soup.select(".product_wrapper"):
-            title_el = item.select_one(".h2")
-            price_el = item.select_one(".price")
-
-            if not title_el or not price_el:
-                continue
-
-            title = title_el.text.strip()
-            price = int(price_el.text.replace("$", "").replace(",", ""))
-            link = "https://www.microcenter.com" + title_el["href"]
-
-            key = f"microcenter|{title}|{price}"
-            if key in seen:
-                continue
-
-            if is_msrp(title, price):
-                send_discord(title, price, link, "Micro Center (Tustin)")
-                seen[key] = True
-
-    except Exception as e:
-        print(f"⚠️ Micro Center skipped: {e}")
-
-# =========================
-# MAIN
-# =========================
+# ======================
+# RUN
+# ======================
 
 if __name__ == "__main__":
-    start = datetime.utcnow()
-    print(f"⏰ Run started at {start} UTC")
+    print(f"⏰ Run started at {datetime.utcnow()} UTC")
 
-    seen = load_seen()
-
-    with requests.Session() as session:
-        check_bestbuy(session, seen)
-        check_amazon(session, seen)
-        check_newegg(session, seen)
-        check_microcenter(session, seen)
-
-    save_seen(seen)
-
-    end = datetime.utcnow()
-    print(f"✅ Run finished in {(end - start).total_seconds()} seconds")
+    if TEST_MODE:
+        run_test()
+    else:
+        for store in STORES:
+            check_store(store)
